@@ -1,0 +1,15 @@
+# Local settings with real credentials
+config.php
+
+# Runtime output
+*.log
+error_log
+proctor_snaps/
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~

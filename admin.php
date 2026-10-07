@@ -7,50 +7,15 @@ $conn = new mysqli($servername, $username, $password, $dbname);
 if ($conn->connect_error) { die("Database Connection failed: " . $conn->connect_error); }
 $conn->set_charset('utf8mb4');
 
-$DRIVE_ERROR = '';
+require_once __DIR__ . '/modules/sections.php';
+ensure_sections_schema($conn);
 
-// --- GOOGLE DRIVE UPLOAD FUNCTION ---
-function uploadToGoogleDrive($file_array) {
-    global $DRIVE_ERROR;
-    $webAppUrl = APPS_SCRIPT_URL;
+require_once __DIR__ . '/modules/admin_helpers.php';
 
-    if (!isset($file_array) || $file_array['error'] !== UPLOAD_ERR_OK) {
-        $DRIVE_ERROR = 'PHP upload error code ' . ($file_array['error'] ?? 'none');
-        return null;
-    }
-
-    $fileName = $file_array['name'];
-    $fileData = base64_encode(file_get_contents($file_array['tmp_name']));
-    $postData = http_build_query(['name' => $fileName, 'data' => $fileData]);
-
-    $ch = curl_init($webAppUrl);
-    curl_setopt_array($ch, [
-        CURLOPT_POST => true,
-        CURLOPT_POSTFIELDS => $postData,
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_HTTPHEADER => ['Content-Type: application/x-www-form-urlencoded'],
-        CURLOPT_FOLLOWLOCATION => true,
-        CURLOPT_TIMEOUT => 120,
-    ]);
-    $response = curl_exec($ch);
-    if ($response === false) { $DRIVE_ERROR = 'cURL: ' . curl_error($ch); curl_close($ch); return null; }
-    curl_close($ch);
-
-    $data = json_decode($response, true);
-    if ($data && ($data['status'] ?? '') === 'success') return $data['url'];
-    $DRIVE_ERROR = 'Drive response: ' . substr(strip_tags((string)$response), 0, 200);
-    return null;
-}
-
-function fetch_subjects($conn) {
-    $result = $conn->query("SELECT subject_id, subject_name FROM subjects ORDER BY subject_name");
-    $subjects = [];
-    if ($result) { while ($row = $result->fetch_assoc()) { $subjects[] = $row; } }
-    return $subjects;
-}
-
-function num_or_null($v) {
-    return ($v === null || $v === '' || !is_numeric($v)) ? null : (float)$v;
+// Back to the question list, keeping the section filter
+function back_to_list() {
+    $f = $_POST['return_section'] ?? '';
+    header("Location: admin.php" . ($f !== '' ? '?section=' . urlencode($f) : '') . "#list"); exit();
 }
 
 // ================= BULK: ONE QUESTION PER AJAX REQUEST =================
@@ -60,6 +25,7 @@ if (($_POST['action'] ?? '') === 'bulk_one') {
     $fail = function ($msg) { echo json_encode(['ok' => false, 'error' => $msg]); exit(); };
 
     $subject_id = !empty($_POST['subject_id']) ? (int)$_POST['subject_id'] : null;
+    $section_id = id_or_null($_POST['section_id'] ?? null);
     $q_type = in_array($_POST['q_type'] ?? '', ['MCQ', 'MSQ', 'NAT'], true) ? $_POST['q_type'] : 'MCQ';
     $marks = (float)($_POST['marks'] ?? 1);
     $explanation = $_POST['explanation'] ?? '';
@@ -98,13 +64,58 @@ if (($_POST['action'] ?? '') === 'bulk_one') {
     $options_json = json_encode($options);
     $correct_json = json_encode($correct);
 
-    $stmt = $conn->prepare("INSERT INTO questions (subject_id, q_type, q_text_url, options_json, correct_answer_json, explanation, marks, range_min, range_max, set_no) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)");
+    $stmt = $conn->prepare("INSERT INTO questions (subject_id, section_id, q_type, q_text_url, options_json, correct_answer_json, explanation, marks, range_min, range_max, set_no) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)");
     if (!$stmt) $fail('DB prepare: ' . $conn->error);
-    $stmt->bind_param("isssssddd", $subject_id, $q_type, $q_text_url, $options_json, $correct_json, $explanation, $marks, $range_min, $range_max);
+    $stmt->bind_param("iisssssddd", $subject_id, $section_id, $q_type, $q_text_url, $options_json, $correct_json, $explanation, $marks, $range_min, $range_max);
     if (!$stmt->execute()) $fail('DB insert: ' . $stmt->error);
 
     echo json_encode(['ok' => true, 'id' => $conn->insert_id]);
     exit();
+}
+
+// --- SECTIONS: add / rename + reorder / delete ---
+if (isset($_POST['section_action'])) {
+    $sa = $_POST['section_action'];
+    $sid = (int)($_POST['section_id'] ?? 0);
+    $name = trim($_POST['section_name'] ?? '');
+    $order = (int)($_POST['sort_order'] ?? 0);
+
+    if ($sa === 'add' && $name !== '') {
+        $stmt = $conn->prepare("INSERT INTO sections (section_name, sort_order) VALUES (?, ?)");
+        $stmt->bind_param("si", $name, $order);
+        $_SESSION['message'] = $stmt->execute() ? "Section \"$name\" created." : "Could not create section: " . $stmt->error;
+    } elseif ($sa === 'update' && $sid > 0 && $name !== '') {
+        $stmt = $conn->prepare("UPDATE sections SET section_name = ?, sort_order = ? WHERE section_id = ?");
+        $stmt->bind_param("sii", $name, $order, $sid);
+        $_SESSION['message'] = $stmt->execute() ? "Section saved." : "Could not save section: " . $stmt->error;
+    } elseif ($sa === 'delete' && $sid > 0) {
+        // Its questions are kept, they just lose their section
+        $conn->query("UPDATE questions SET section_id = NULL WHERE section_id = $sid");
+        $conn->query("DELETE FROM sections WHERE section_id = $sid");
+        $_SESSION['message'] = "Section deleted. Its questions are now without a section.";
+    }
+    header("Location: admin.php?tab=sections"); exit();
+}
+
+// --- Move ticked questions to a section ---
+if (($_POST['assign_action'] ?? '') === 'assign') {
+    $ids = array_filter(array_map('intval', $_POST['question_ids'] ?? []));
+    $ts = $_POST['target_section'] ?? 'keep';
+    if (!$ids) {
+        $_SESSION['message'] = "Tick at least one question first.";
+    } elseif ($ts === 'keep') {
+        $_SESSION['message'] = "Pick a section to assign.";
+    } else {
+        foreach ($ids as $qid) {
+            if ($ts !== 'keep') {
+                $v = id_or_null($ts);
+                $stmt = $conn->prepare("UPDATE questions SET section_id = ? WHERE id = ? AND passage_id IS NULL");
+                $stmt->bind_param("ii", $v, $qid); $stmt->execute();
+            }
+        }
+        $_SESSION['message'] = count($ids) . " question(s) updated.";
+    }
+    back_to_list();
 }
 
 // Handle Subject add
@@ -131,6 +142,7 @@ if (isset($_POST['action'])) {
 
     if ($action === 'create' || $action === 'update') {
         $subject_id = !empty($_POST['subject_id']) ? (int)$_POST['subject_id'] : null;
+        $section_id = id_or_null($_POST['section_id'] ?? null);
         $q_type = $_POST['q_type'];
         $marks = (float)$_POST['marks'];
         $explanation = $_POST['explanation'] ?? '';
@@ -171,11 +183,12 @@ if (isset($_POST['action'])) {
         $correct_answer_json = json_encode(is_array($correct_answers) ? array_values($correct_answers) : [$correct_answers]);
 
         if ($action === 'create') {
-            $stmt = $conn->prepare("INSERT INTO questions (subject_id, q_type, q_text_url, options_json, correct_answer_json, explanation, marks, range_min, range_max, set_no) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)");
-            $stmt->bind_param("isssssddd", $subject_id, $q_type, $q_text_url, $options_json, $correct_answer_json, $explanation, $marks, $range_min, $range_max);
+            $stmt = $conn->prepare("INSERT INTO questions (subject_id, section_id, q_type, q_text_url, options_json, correct_answer_json, explanation, marks, range_min, range_max, set_no) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)");
+            $stmt->bind_param("iisssssddd", $subject_id, $section_id, $q_type, $q_text_url, $options_json, $correct_answer_json, $explanation, $marks, $range_min, $range_max);
         } else {
-            $stmt = $conn->prepare("UPDATE questions SET subject_id=?, q_type=?, q_text_url=?, options_json=?, correct_answer_json=?, explanation=?, marks=?, range_min=?, range_max=? WHERE id=?");
-            $stmt->bind_param("isssssdddi", $subject_id, $q_type, $q_text_url, $options_json, $correct_answer_json, $explanation, $marks, $range_min, $range_max, $id);
+            // A question in a group keeps its group's section (groups are managed in paper_builder.php)
+            $stmt = $conn->prepare("UPDATE questions SET subject_id=?, section_id=IF(passage_id IS NULL, ?, section_id), q_type=?, q_text_url=?, options_json=?, correct_answer_json=?, explanation=?, marks=?, range_min=?, range_max=? WHERE id=?");
+            $stmt->bind_param("iisssssdddi", $subject_id, $section_id, $q_type, $q_text_url, $options_json, $correct_answer_json, $explanation, $marks, $range_min, $range_max, $id);
         }
 
         $_SESSION['message'] = $stmt->execute() ? "Saved to database and Google Drive." : "DB error: " . $stmt->error;
@@ -183,9 +196,26 @@ if (isset($_POST['action'])) {
     }
 }
 
-// Fetch subjects and questions
+// Fetch subjects, sections and questions
 $subjects = fetch_subjects($conn);
-$q_res = $conn->query("SELECT q.*, s.subject_name FROM questions q LEFT JOIN subjects s ON q.subject_id = s.subject_id ORDER BY q.id DESC LIMIT 15");
+$sections = fetch_sections($conn);
+$no_section_count = (int)$conn->query("SELECT COUNT(*) FROM questions WHERE section_id IS NULL")->fetch_row()[0];
+
+// Question list: latest 15, or every question of one section ('none' = without a section)
+$section_filter = $_GET['section'] ?? '';
+$q_sql = "SELECT q.*, s.subject_name, sec.section_name, p.title AS group_title FROM questions q
+          LEFT JOIN subjects s ON q.subject_id = s.subject_id
+          LEFT JOIN sections sec ON q.section_id = sec.section_id
+          LEFT JOIN passages p ON q.passage_id = p.passage_id";
+if ($section_filter === 'none') {
+    $q_sql .= " WHERE q.section_id IS NULL ORDER BY q.id DESC LIMIT 500";
+} elseif ((int)$section_filter > 0) {
+    $q_sql .= " WHERE q.section_id = " . (int)$section_filter . " ORDER BY q.id DESC LIMIT 500";
+} else {
+    $section_filter = '';
+    $q_sql .= " ORDER BY q.id DESC LIMIT 15";
+}
+$q_res = $conn->query($q_sql);
 $questions = [];
 while ($row = $q_res->fetch_assoc()) {
     $row['options_json'] = json_decode($row['options_json'], true) ?? [];
@@ -212,7 +242,12 @@ while ($row = $q_res->fetch_assoc()) {
 </div>
 
 <div class="max-w-6xl mx-auto">
-    <h1 class="text-3xl font-extrabold mb-8 border-b-4 border-blue-600 pb-2">GATE Admin (Google Drive Direct)</h1>
+    <h1 class="text-3xl font-extrabold mb-4 border-b-4 border-blue-600 pb-2">GATE Admin (Google Drive Direct)</h1>
+
+    <a href="paper_builder.php" class="block mb-6 p-4 rounded-xl bg-blue-600 text-white shadow hover:bg-blue-700">
+        <span class="text-lg font-bold">Question Paper Builder &rarr;</span>
+        <span class="block text-sm opacity-90">Build a test section by section: add questions, passage groups with their sub-questions, and questions from the bank below.</span>
+    </a>
 
     <?php if (isset($_SESSION['message'])): ?>
         <div class="bg-green-500 text-white p-4 rounded mb-4"><?php echo htmlspecialchars($_SESSION['message']); unset($_SESSION['message']); ?></div>
@@ -222,6 +257,7 @@ while ($row = $q_res->fetch_assoc()) {
     <div class="flex space-x-2 mb-4">
         <button id="tab-single" onclick="showTab('single')" class="px-5 py-2 rounded-t font-bold bg-white text-blue-700 shadow">Single question</button>
         <button id="tab-bulk" onclick="showTab('bulk')" class="px-5 py-2 rounded-t font-bold bg-gray-300 text-gray-700">Folder / bulk upload</button>
+        <button id="tab-sections" onclick="showTab('sections')" class="px-5 py-2 rounded-t font-bold bg-gray-300 text-gray-700">Sections</button>
     </div>
 
     <!-- ================= SINGLE ================= -->
@@ -232,7 +268,7 @@ while ($row = $q_res->fetch_assoc()) {
             <input type="hidden" name="id" id="q-id" value="0">
             <input type="hidden" name="existing_q_url" id="existing_q_url" value="">
 
-            <div class="grid grid-cols-3 gap-4 mb-4">
+            <div class="grid grid-cols-4 gap-4 mb-4">
                 <div>
                     <label class="block text-sm">Question Type</label>
                     <select name="q_type" id="q_type" class="w-full border p-2 rounded" onchange="renderUI(this.value)">
@@ -247,6 +283,15 @@ while ($row = $q_res->fetch_assoc()) {
                         <option value="">Select Subject</option>
                         <?php foreach ($subjects as $s): ?>
                             <option value="<?php echo $s['subject_id']; ?>"><?php echo htmlspecialchars($s['subject_name']); ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+                <div>
+                    <label class="block text-sm">Section</label>
+                    <select name="section_id" id="section_id" class="w-full border p-2 rounded">
+                        <option value="">No section</option>
+                        <?php foreach ($sections as $o): ?>
+                            <option value="<?php echo $o['section_id']; ?>"><?php echo htmlspecialchars($o['section_name']); ?></option>
                         <?php endforeach; ?>
                     </select>
                 </div>
@@ -308,6 +353,13 @@ while ($row = $q_res->fetch_assoc()) {
                         <option value="<?php echo $s['subject_id']; ?>"><?php echo htmlspecialchars($s['subject_name']); ?></option>
                     <?php endforeach; ?>
                 </select>
+                <label class="block font-bold mt-2 mb-1">Section for all</label>
+                <select id="bulk-section" class="w-full border p-2 rounded">
+                    <option value="">No section</option>
+                        <?php foreach ($sections as $o): ?>
+                            <option value="<?php echo $o['section_id']; ?>"><?php echo htmlspecialchars($o['section_name']); ?></option>
+                        <?php endforeach; ?>
+                </select>
                 <label class="block text-sm mt-2">Default marks (if no CSV)</label>
                 <input type="number" step="0.5" id="bulk-marks" value="1" class="w-full border p-2 rounded">
             </div>
@@ -337,17 +389,106 @@ while ($row = $q_res->fetch_assoc()) {
         </div>
     </div>
 
+    <!-- ================= SECTIONS & PASSAGES ================= -->
+    <div id="panel-sections" class="bg-white p-6 rounded-xl shadow-lg mb-8 hidden">
+        <h2 class="text-xl font-bold mb-2">Sections</h2>
+        <p class="text-sm text-gray-600 mb-4">
+            Sections appear as tabs in the exam, in the order below (lowest number first), for example
+            <b>General Aptitude</b> then <b>Computer Science</b>. A test shows every section that has at least one of its questions.
+            Questions without a section are shown under the subject name. To put questions in a section, pick it in the question form,
+            in bulk upload, or tick questions in the list below and use <b>Assign</b>.
+        </p>
+
+        <table class="w-full text-sm border mb-4">
+            <thead class="bg-gray-100">
+                <tr>
+                    <th class="p-2 border text-left">Name</th>
+                    <th class="p-2 border w-28">Order</th>
+                    <th class="p-2 border w-28">Questions</th>
+                    <th class="p-2 border w-56"></th>
+                </tr>
+            </thead>
+            <tbody>
+                <?php foreach ($sections as $sec): $fid = 'sec-form-' . $sec['section_id']; ?>
+                <tr>
+                    <td class="p-2 border">
+                        <form id="<?php echo $fid; ?>" method="POST"><input type="hidden" name="section_id" value="<?php echo $sec['section_id']; ?>"></form>
+                        <input form="<?php echo $fid; ?>" name="section_name" value="<?php echo htmlspecialchars($sec['section_name']); ?>" class="border p-1 rounded w-full" required>
+                    </td>
+                    <td class="p-2 border"><input form="<?php echo $fid; ?>" type="number" name="sort_order" value="<?php echo (int)$sec['sort_order']; ?>" class="border p-1 rounded w-20"></td>
+                    <td class="p-2 border text-center">
+                        <a href="admin.php?section=<?php echo $sec['section_id']; ?>#list" class="text-blue-700 underline"><?php echo (int)$sec['question_count']; ?></a>
+                    </td>
+                    <td class="p-2 border text-right space-x-2">
+                        <button form="<?php echo $fid; ?>" name="section_action" value="update" class="bg-blue-600 text-white px-3 py-1 rounded">Save</button>
+                        <button form="<?php echo $fid; ?>" name="section_action" value="delete" onclick="return confirm('Delete this section? Its questions are kept but lose their section.')" class="bg-red-500 text-white px-3 py-1 rounded">Delete</button>
+                    </td>
+                </tr>
+                <?php endforeach; ?>
+                <tr class="bg-gray-50">
+                    <td class="p-2 border italic text-gray-600">No section</td>
+                    <td class="p-2 border"></td>
+                    <td class="p-2 border text-center"><a href="admin.php?section=none#list" class="text-blue-700 underline"><?php echo $no_section_count; ?></a></td>
+                    <td class="p-2 border"></td>
+                </tr>
+            </tbody>
+        </table>
+
+        <form method="POST" class="flex space-x-2 mb-10">
+            <input type="text" name="section_name" placeholder="New section name, e.g. General Aptitude" class="border p-2 rounded flex-grow" required>
+            <input type="number" name="sort_order" value="<?php echo count($sections) + 1; ?>" title="Order" class="border p-2 rounded w-24">
+            <button name="section_action" value="add" class="bg-gray-700 text-white px-4 py-2 rounded">Create section</button>
+        </form>
+
+        <p class="text-sm text-gray-600 pt-4 border-t">Passage questions (reading comprehension, common data) are created as <b>question groups</b> in the
+            <a href="paper_builder.php" class="text-blue-700 underline font-bold">Question Paper Builder</a>.</p>
+    </div>
+
     <!-- ================= LIST ================= -->
-    <div class="bg-white p-6 rounded-xl shadow-lg">
-        <h2 class="text-xl font-bold mb-4">Questions List (latest 15)</h2>
+    <div id="list" class="bg-white p-6 rounded-xl shadow-lg">
+        <div class="flex justify-between items-center mb-4">
+            <h2 class="text-xl font-bold">
+                <?php if ($section_filter === ''): ?>Questions List (latest 15)
+                <?php elseif ($section_filter === 'none'): ?>Questions without a section (<?php echo count($questions); ?>)
+                <?php else: ?>Questions in this section (<?php echo count($questions); ?>)<?php endif; ?>
+            </h2>
+            <form method="GET" action="admin.php#list" class="flex items-center space-x-2 text-sm">
+                <label>Show</label>
+                <select name="section" onchange="this.form.submit()" class="border p-2 rounded">
+                    <option value="">Latest 15</option>
+                    <option value="none" <?php echo $section_filter === 'none' ? 'selected' : ''; ?>>Without a section</option>
+                    <?php foreach ($sections as $sec): ?>
+                        <option value="<?php echo $sec['section_id']; ?>" <?php echo (string)$section_filter === (string)$sec['section_id'] ? 'selected' : ''; ?>><?php echo htmlspecialchars($sec['section_name']); ?></option>
+                    <?php endforeach; ?>
+                </select>
+            </form>
+        </div>
+
+        <!-- Move ticked questions to a section -->
+        <form id="assign-form" method="POST" class="flex items-center space-x-2 mb-4 p-3 bg-blue-50 border border-blue-200 rounded text-sm">
+            <input type="hidden" name="assign_action" value="assign">
+            <input type="hidden" name="return_section" value="<?php echo htmlspecialchars($section_filter); ?>">
+            <label class="flex items-center space-x-1"><input type="checkbox" onclick="document.querySelectorAll('.q-pick').forEach(c => c.checked = this.checked)"><span>All</span></label>
+            <span class="flex-grow">Set ticked questions to</span>
+            <select name="target_section" class="border p-2 rounded">
+                <option value="keep">Section: keep as is</option>
+                <option value="">Section: none</option>
+                <?php foreach ($sections as $o): ?>
+                    <option value="<?php echo $o['section_id']; ?>">Section: <?php echo htmlspecialchars($o['section_name']); ?></option>
+                <?php endforeach; ?>
+            </select>
+            <button class="bg-blue-600 text-white px-4 py-2 rounded font-bold">Assign</button>
+        </form>
+
         <div class="space-y-4">
             <?php foreach ($questions as $q): ?>
             <div class="border p-4 rounded-lg flex justify-between items-center bg-white shadow-sm">
                 <div class="flex items-center space-x-4">
+                    <input type="checkbox" form="assign-form" name="question_ids[]" value="<?php echo $q['id']; ?>" class="q-pick w-5 h-5">
                     <img src="<?php echo htmlspecialchars($q['q_text_url']); ?>" class="h-16 w-16 object-contain border rounded bg-gray-50">
                     <div>
                         <div class="font-bold text-blue-700">#<?php echo $q['id']; ?> (<?php echo $q['q_type']; ?>)</div>
-                        <div class="text-sm text-gray-500"><?php echo htmlspecialchars($q['subject_name'] ?? ''); ?> | <?php echo $q['marks']; ?> Marks</div>
+                        <div class="text-sm text-gray-500"><?php echo htmlspecialchars($q['subject_name'] ?? ''); ?> | <?php echo htmlspecialchars($q['section_name'] ?? 'No section'); ?> | <?php echo $q['marks']; ?> Marks<?php if (!empty($q['group_title'])): ?> | Group: <?php echo htmlspecialchars($q['group_title']); ?><?php endif; ?></div>
                     </div>
                 </div>
                 <div class="flex space-x-2">
@@ -371,11 +512,11 @@ const loader = document.getElementById('loader');
 function showLoader() { loader.style.display = 'flex'; }
 
 function showTab(t) {
-    const single = t === 'single';
-    document.getElementById('panel-single').classList.toggle('hidden', !single);
-    document.getElementById('panel-bulk').classList.toggle('hidden', single);
-    document.getElementById('tab-single').className = 'px-5 py-2 rounded-t font-bold ' + (single ? 'bg-white text-blue-700 shadow' : 'bg-gray-300 text-gray-700');
-    document.getElementById('tab-bulk').className = 'px-5 py-2 rounded-t font-bold ' + (!single ? 'bg-white text-blue-700 shadow' : 'bg-gray-300 text-gray-700');
+    ['single', 'bulk', 'sections'].forEach(name => {
+        const on = name === t;
+        document.getElementById('panel-' + name).classList.toggle('hidden', !on);
+        document.getElementById('tab-' + name).className = 'px-5 py-2 rounded-t font-bold ' + (on ? 'bg-white text-blue-700 shadow' : 'bg-gray-300 text-gray-700');
+    });
 }
 
 function renderUI(type, data = null) {
@@ -411,6 +552,7 @@ function editQ(q) {
     document.getElementById('q-id').value = q.id;
     document.getElementById('q_type').value = q.q_type;
     document.getElementById('subject_id').value = q.subject_id ?? '';
+    document.getElementById('section_id').value = q.section_id ?? '';
     document.getElementById('marks').value = q.marks;
     document.getElementById('explanation').value = q.explanation ?? '';
     document.getElementById('existing_q_url').value = q.q_text_url;
@@ -530,6 +672,7 @@ async function startBulk() {
         const fd = new FormData();
         fd.append('action', 'bulk_one');
         fd.append('subject_id', subject);
+        fd.append('section_id', document.getElementById('bulk-section').value);
         fd.append('q_type', q.type);
         fd.append('marks', q.marks);
         fd.append('q_file', q.q, q.q.name);
@@ -565,6 +708,7 @@ async function startBulk() {
 
 // Init
 renderUI('MCQ');
+if (new URLSearchParams(location.search).get('tab') === 'sections') showTab('sections');
 </script>
 </body>
 </html>

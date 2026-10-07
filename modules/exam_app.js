@@ -6,6 +6,20 @@ const AUTOSAVE_INTERVAL_MS = 7000;
 
 const questions = window.EXAM_CONFIG.questions;
 const totalQuestions = window.EXAM_CONFIG.totalQuestions;
+const passages = window.EXAM_CONFIG.passages || {};
+
+// Sections in exam order: questions arrive grouped by section, so each section is one
+// contiguous run of question indexes { name, start, end }.
+const sections = [];
+(questions || []).forEach((q, i) => {
+    const name = q.section || 'Questions';
+    const last = sections[sections.length - 1];
+    if (last && last.name === name) last.end = i;
+    else sections.push({ name, start: i, end: i });
+});
+const sectionOf = (index) => sections.find(s => index >= s.start && index <= s.end) || sections[0];
+
+const escapeHtml = (str) => String(str ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
 let testStartTimeString = null; 
 const getMysqlTimestamp = () => {
@@ -103,12 +117,34 @@ const showTest = () => {
     startAutosave();
 };
 
+const renderSectionTabs = () => {
+    const tabsEl = document.getElementById('section-tabs');
+    if (!tabsEl) return;
+    const current = sectionOf(currentQuestionIndex);
+    tabsEl.innerHTML = '';
+    sections.forEach(sec => {
+        const tab = document.createElement('div');
+        const active = sec === current;
+        tab.className = 'px-4 py-2 text-sm font-bold rounded-t-md border cursor-pointer ' +
+            (active ? 'bg-[#287baf] text-white border-[#287baf]' : 'bg-white text-[#287baf] border-gray-300 hover:bg-blue-50');
+        tab.textContent = sec.name;
+        tab.onclick = () => { if (!active) navigateToQuestion(sec.start); };
+        tabsEl.appendChild(tab);
+    });
+};
+
+// Palette and counts cover the current section only (TCS iON / GATE behaviour)
 const renderPalette = () => {
     const paletteEl = document.getElementById('question-palette');
     paletteEl.innerHTML = '';
     const statusCounts = { 'not_visited': 0, 'not_answered': 0, 'marked_for_review': 0, 'answered': 0 };
+    const sec = sectionOf(currentQuestionIndex);
+    const secNameEl = document.getElementById('palette-section-name');
+    if (secNameEl) secNameEl.textContent = sec ? sec.name : '';
+    renderSectionTabs();
 
     questions.forEach((q, index) => {
+        if (sec && (index < sec.start || index > sec.end)) return;
         const state = testState[index];
         const status = state.status;
         if (status === 'answered' || status === 'answered_marked_for_review') statusCounts['answered']++;
@@ -147,6 +183,23 @@ const renderQuestion = () => {
     if (document.getElementById('question-type-display')) document.getElementById('question-type-display').textContent = q.type;
     if (document.getElementById('marks-display')) document.getElementById('marks-display').textContent = marks.toFixed(1);
     if (document.getElementById('negative-display')) document.getElementById('negative-display').textContent = negativeMarks;
+
+    // Passage questions: passage on the left, question on the right
+    const passage = q.passageId ? passages[q.passageId] : null;
+    const passagePane = document.getElementById('passage-pane');
+    if (passagePane) {
+        passagePane.style.display = passage ? '' : 'none';
+        if (passage) {
+            const content = document.getElementById('passage-content');
+            const html = (passage.image ? `<img src="${getSafeImageUrl(passage.image)}" alt="Passage" class="max-w-full h-auto object-contain mb-4">` : '') +
+                         (passage.text ? `<div style="white-space: pre-wrap;">${escapeHtml(passage.text)}</div>` : '');
+            if (content.dataset.passageId !== String(q.passageId)) {
+                content.innerHTML = html;
+                content.dataset.passageId = q.passageId;
+                passagePane.scrollTop = 0;
+            }
+        }
+    }
 
     const qTextEl = document.getElementById('question-text');
     // 🔥 FIXED: Added min-width and object-contain to the main question image to prevent it from being unreadably small

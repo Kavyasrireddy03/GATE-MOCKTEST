@@ -15,6 +15,9 @@ if ($conn->connect_error) {
     die("Database Connection failed: " . $conn->connect_error);
 }
 
+require_once __DIR__ . '/modules/sections.php';
+ensure_sections_schema($conn);
+
 // Creating User session
 $user_id = $_SESSION['user_id'];
 $user_info_query = $conn->query("SELECT name, REG_ID FROM users WHERE user_id='$user_id'");
@@ -39,6 +42,7 @@ if ($selected && strpos($selected, '|') !== false) {
 
 // Initializing questions
 $questions_json = '[]';
+$passages_json = '{}';
 $total_questions = 0;
 $available_sets = [];
 $questions = []; 
@@ -144,15 +148,30 @@ if ($selected_set) {
     }
     $time_stmt->close();
 
-    $sql = "SELECT id, q_type, q_text_url, options_json, correct_answer_json, explanation, marks, range_min, range_max FROM questions WHERE set_no = ? AND subject_id = ? ORDER BY RAND()";
+    // Grouped by section (in the admin's section order), passage questions kept together
+    // at the end of their section, random order otherwise
+    $sql = "SELECT q.id, q.q_type, q.q_text_url, q.options_json, q.correct_answer_json, q.explanation, q.marks, q.range_min, q.range_max,
+                   sec.section_name, q.passage_id, p.passage_text, p.passage_image_url
+            FROM questions q
+            LEFT JOIN sections sec ON sec.section_id = q.section_id
+            LEFT JOIN passages p ON p.passage_id = q.passage_id
+            WHERE q.set_no = ? AND q.subject_id = ?
+            ORDER BY COALESCE(sec.sort_order, 2147483647), q.section_id, (p.passage_id IS NOT NULL), p.passage_id, RAND()";
     $stmt = $conn->prepare($sql);
     $stmt->bind_param("ii", $selected_set_int, $selected_subject);
     $stmt->execute();
-    $stmt->bind_result($id, $q_type, $q_text_url, $options_json, $correct_answer_json, $explanation, $marks, $range_min, $range_max);
+    $stmt->bind_result($id, $q_type, $q_text_url, $options_json, $correct_answer_json, $explanation, $marks, $range_min, $range_max,
+                       $section_name, $passage_id, $passage_text, $passage_image_url);
 
+    $passages = [];
     while ($stmt->fetch()) {
+        if ($passage_id) {
+            $passages[(int)$passage_id] = ['text' => (string)$passage_text, 'image' => (string)$passage_image_url];
+        }
         $questions[] = [
             'id'            => (int)$id,
+            'section'       => $section_name ?: $subject_name,
+            'passageId'     => $passage_id ? (int)$passage_id : null,
             'type'          => $q_type,
             'imageText'     => $q_text_url,
             'options'       => json_decode($options_json, true) ?? [],
@@ -166,6 +185,7 @@ if ($selected_set) {
     $conn->close();
 
     $questions_json = json_encode($questions, JSON_INVALID_UTF8_IGNORE);
+    $passages_json = json_encode((object)$passages, JSON_INVALID_UTF8_IGNORE);
     $total_questions = count($questions);
     
     if ($total_questions === 0) die("Error: No questions found.");
@@ -204,6 +224,7 @@ if ($selected_set) {
     <script src="<?= CDN_JQUERY_UI ?>"></script>
     <link rel="stylesheet" href="modules/exam_style.css">
     <link rel="stylesheet" href="modules/calculator.css">
+    <link rel="stylesheet" href="modules/exam_popups.css">
 
     <style>
         .watermark-container::before {
@@ -223,12 +244,14 @@ if ($selected_set) {
     <script>
         window.EXAM_CONFIG = {
             questions:       <?php echo $questions_json; ?>,
+            passages:        <?php echo $passages_json; ?>,
             totalQuestions:  <?php echo $total_questions; ?>,
             durationSeconds: <?php echo (int)$test_duration_seconds; ?>,
             durationMinutes: <?php echo (int)$duration_minutes; ?>,
             subjectId:       <?php echo (int)$selected_subject; ?>,
             setNo:           <?php echo (int)$selected_set_int; ?>,
-            isSetSelected:   <?php echo $selected_set ? 'true' : 'false'; ?>
+            isSetSelected:   <?php echo $selected_set ? 'true' : 'false'; ?>,
+            sectionName:     <?php echo json_encode($subject_name); ?>
         };
     </script>
 </head>
@@ -275,6 +298,14 @@ if ($selected_set) {
                         <span><?= htmlspecialchars($subject_name) ?> Mock</span>
                     </div>
                     <div class="flex items-center gap-6 text-white font-normal">
+                        <div id="xp-instr-link" class="xp-link">
+                            <span class="xp-ico info">i</span>
+                            <span class="text-xs font-semibold">Instructions</span>
+                        </div>
+                        <div id="xp-paper-link" class="xp-link">
+                            <span class="xp-ico paper">description</span>
+                            <span class="text-xs font-semibold">Question Paper</span>
+                        </div>
                         <div id="calculatorBtn" class="flex items-center gap-1 cursor-pointer hover:text-blue-200 transition-colors">
                             <i class="material-icons text-sm">calculate</i>
                             <span class="text-xs">Scientific Calculator</span>
@@ -293,11 +324,8 @@ if ($selected_set) {
                 <!-- Section tabs -->
                 <div class="flex-grow flex flex-col justify-end">
                     <div class="px-4 py-1 text-[10px] font-bold text-gray-600 uppercase tracking-widest">Sections</div>
-                    <div class="flex items-center px-4 gap-1">
-                        <div class="bg-[#287baf] text-white px-4 py-2 text-sm font-bold rounded-t-md border border-[#287baf]">
-                            <?= htmlspecialchars($subject_name) ?>
-                        </div>
-                    </div>
+                    <!-- One tab per section (filled by modules/exam_app.js) -->
+                    <div id="section-tabs" class="flex items-center px-4 gap-1"></div>
                 </div>
 
                 <!-- Timer + candidate -->
@@ -361,9 +389,19 @@ if ($selected_set) {
                                     Question No. <span id="question-number">1</span>
                                 </h2>
                             </div>
-                            <div class="p-6 overflow-y-auto flex-grow watermark-container">
-                                <div id="question-text" class="text-lg text-gray-900 leading-relaxed mb-6 relative z-10"></div>
-                                <div id="options-container" class="space-y-2 relative z-10"></div>
+                            <div class="flex flex-grow min-h-0">
+                                <!-- Passage pane: shown on the left for passage (comprehension) questions -->
+                                <div id="passage-pane" style="display:none" class="w-1/2 border-r-2 border-gray-300 p-6 overflow-y-auto watermark-container">
+                                    <div class="relative z-10">
+                                        <p class="font-bold text-black mb-3"><span class="text-red-600">NOTE:</span> After selecting your response to the sub question, you must click <span class="text-red-600">'SAVE &amp; NEXT'</span> to move to the next sub question.</p>
+                                        <p class="font-bold text-black mb-3">Read the passage given below and answer the questions that follow:</p>
+                                        <div id="passage-content" class="text-[15px] text-gray-900 leading-relaxed"></div>
+                                    </div>
+                                </div>
+                                <div id="question-pane" class="p-6 overflow-y-auto flex-grow watermark-container">
+                                    <div id="question-text" class="text-lg text-gray-900 leading-relaxed mb-6 relative z-10"></div>
+                                    <div id="options-container" class="space-y-2 relative z-10"></div>
+                                </div>
                             </div>
                         </div>
 
@@ -375,6 +413,7 @@ if ($selected_set) {
                         <div class="space-y-4 overflow-y-auto pr-2 max-h-full" style="max-height: calc(100vh - 120px);">
                             <div class="bg-white p-4 rounded-xl shadow-lg border-t-4 border-yellow-500">
                                 <h3 class="choose-title text-gray-800 border-b pb-2">Question Palette</h3>
+                                <div id="palette-section-name" class="bg-[#287baf] text-white text-sm font-bold px-3 py-1 mb-2 rounded"></div>
                                 <div id="question-palette" class="questionMatrix"></div>
                                 <div class="mt-4 border-t pt-3 space-y-2 text-sm">
                                     <div class="flex justify-between items-center">
@@ -522,6 +561,27 @@ if ($selected_set) {
         </div>
 
         <!-- ═══════════════════════════════════════════
+             INSTRUCTIONS + QUESTION PAPER POPUPS (modules/exam_popups.js)
+        ════════════════════════════════════════════ -->
+        <div id="xp-instr" class="xp-overlay hidden">
+            <div class="xp-modal">
+                <div class="xp-titlebar"><span>Instructions</span><span class="xp-close">Close &#10006;</span></div>
+                <div class="xp-note">Note that the timer is ticking. Kindly close this window to attend to the questions.</div>
+                <div class="xp-body xp-instr">
+                    <?php include __DIR__ . '/modules/general_instructions.php'; ?>
+                </div>
+            </div>
+        </div>
+
+        <div id="xp-paper" class="xp-overlay hidden">
+            <div class="xp-modal">
+                <div class="xp-titlebar"><span>Question Paper</span><span class="xp-close">Close &#10006;</span></div>
+                <div class="xp-note">Note that the timer is ticking while you read this question paper. Close this page to return to answering the questions.</div>
+                <div class="xp-body" id="xp-paper-body"></div>
+            </div>
+        </div>
+
+        <!-- ═══════════════════════════════════════════
              SUBMIT CONFIRMATION MODAL
         ════════════════════════════════════════════ -->
         <div id="submit-modal-overlay" class="fixed inset-0 bg-black bg-opacity-40 z-50 hidden flex justify-center items-center">
@@ -607,7 +667,8 @@ if ($selected_set) {
     <script src="modules/face_proctor.js?v=3"></script>
     <?php endif; ?>
     <script src="modules/calculator.js"></script>
-    <script src="modules/exam_app.js?v=5"></script>
+    <script src="modules/exam_app.js?v=6"></script>
+    <script src="modules/exam_popups.js?v=2"></script>
 
 </body>
 </html>

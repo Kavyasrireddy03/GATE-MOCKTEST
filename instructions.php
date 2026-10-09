@@ -19,7 +19,11 @@ if ($conn->connect_error) {
 }
 
 require_once __DIR__ . '/modules/sections.php';
+require_once __DIR__ . '/modules/coding.php';
 ensure_sections_schema($conn);
+ensure_coding_schema($conn);
+$coding_filter = coding_filter_sql($conn);
+$coding_count = 0;
 
 $user_id = $_SESSION['user_id'];
 
@@ -58,23 +62,24 @@ if ($selected && strpos($selected, '|') !== false) {
     }
 
     // 2. Fetch Marks, per section (questions without a section count under the subject name)
-    $stmt = $conn->prepare("SELECT q.marks, sec.section_name, subj.subject_name
+    $stmt = $conn->prepare("SELECT q.marks, sec.section_name, subj.subject_name, q.q_type
                             FROM questions q
                             LEFT JOIN sections sec ON sec.section_id = q.section_id
                             LEFT JOIN subjects subj ON subj.subject_id = q.subject_id
-                            WHERE q.set_no = ? AND q.subject_id = ?
+                            WHERE q.set_no = ? AND q.subject_id = ?$coding_filter
                             ORDER BY COALESCE(sec.sort_order, 2147483647), q.section_id");
     if ($stmt) {
         $stmt->bind_param("ii", $selected_set, $selected_subject);
         $stmt->execute();
-        $stmt->bind_result($marks, $sec_name, $subj_name);
+        $stmt->bind_result($marks, $sec_name, $subj_name, $q_type);
         while ($stmt->fetch()) {
             $total_questions++;
             $total_marks_val += (float)$marks;
             if ((float)$marks == 1) $q_1_mark++;
             if ((float)$marks == 2) $q_2_mark++;
             $name = $sec_name ?: ($subj_name ?: 'Subject-specific section');
-            $section_rows[$name] = $section_rows[$name] ?? ['one' => 0, 'two' => 0];
+            $section_rows[$name] = $section_rows[$name] ?? ['one' => 0, 'two' => 0, 'code' => 0];
+            if ($q_type === 'CODE') { $section_rows[$name]['code']++; $coding_count++; continue; }
             if ((float)$marks == 1) $section_rows[$name]['one']++;
             if ((float)$marks == 2) $section_rows[$name]['two']++;
         }
@@ -198,17 +203,22 @@ $conn->close();
                             <th>Section</th>
                             <th>1-mark questions</th>
                             <th>2-mark questions</th>
+                            <?php if ($coding_count): ?><th>Coding questions</th><?php endif; ?>
                         </tr>
                         <?php foreach ($section_rows as $sec_label => $row): ?>
                         <tr>
                             <td><?php echo htmlspecialchars($sec_label); ?></td>
                             <td><?php echo $row['one']; ?></td>
                             <td><?php echo $row['two']; ?></td>
+                            <?php if ($coding_count): ?><td><?php echo $row['code']; ?></td><?php endif; ?>
                         </tr>
                         <?php endforeach; ?>
                     </table>
                     
                     <p style="text-align: center;">The 1-mark questions are followed by the 2-mark questions in each section.</p>
+                    <?php if ($coding_count): ?>
+                    <p><b>Coding questions:</b> write your program in the editor and choose the language (C, C++, Python 3 or JavaScript, as allowed for the question). Read input from standard input and print the output to standard output. <b>Compile &amp; Run</b> checks your code against the sample test cases; <b>Submit Code</b> runs all test cases, including hidden ones. Marks are given in proportion to the test cases your last submission passes. There are no negative marks for coding questions.</p>
+                    <?php endif; ?>
                 </div>
 
                 <div class="checkbox-area">

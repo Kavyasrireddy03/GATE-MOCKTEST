@@ -35,6 +35,10 @@
 .xp-q { display: flex; gap: 20px; padding: 18px 0; border-bottom: 1px solid #ddd; }
 .xp-q-no { font: 16px Arial, Helvetica, sans-serif; color: #222; min-width: 42px; flex-shrink: 0; }
 .xp-q-body img.xp-q-img { max-width: 100%; height: auto; }
+.xp-q-meta { margin-top: 10px; font: italic 14px Arial, Helvetica, sans-serif; color: #333; }
+.xp-q-meta b { font-weight: 700; }
+.xp-q-meta .xp-pos { color: #15803d; }
+.xp-q-meta .xp-neg { color: #dc2626; }
 .xp-passage { padding: 18px 0; border-bottom: 1px solid #ddd; font: 15px/1.6 Arial, Helvetica, sans-serif; color: #222; }
 .xp-passage-head { font-weight: bold; margin-bottom: 8px; }
 .xp-passage-text { white-space: pre-wrap; }

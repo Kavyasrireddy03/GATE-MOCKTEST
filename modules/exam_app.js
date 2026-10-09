@@ -180,9 +180,18 @@ const renderQuestion = () => {
     let negativeMarks = (q.type === 'MCQ') ? (marks / 3).toFixed(2) : "0.00";
 
     if (document.getElementById('question-number')) document.getElementById('question-number').textContent = currentQuestionIndex + 1;
-    if (document.getElementById('question-type-display')) document.getElementById('question-type-display').textContent = q.type;
+    if (document.getElementById('question-type-display')) document.getElementById('question-type-display').textContent = q.type === 'CODE' ? 'Coding' : q.type;
     if (document.getElementById('marks-display')) document.getElementById('marks-display').textContent = marks.toFixed(1);
     if (document.getElementById('negative-display')) document.getElementById('negative-display').textContent = negativeMarks;
+
+    if (window.ExamCoding) window.ExamCoding.leave();
+    if (q.type === 'CODE' && window.ExamCoding) {
+        // Coding question: statement on the left, code editor on the right
+        window.ExamCoding.render(q, state, currentQuestionIndex);
+        const reviewBtnC = document.getElementById('mark-review-btn');
+        if (reviewBtnC) reviewBtnC.textContent = state.status.includes('marked') ? 'Marked for Review' : 'Mark for Review & Next';
+        return;
+    }
 
     // Passage questions: passage on the left, question on the right
     const passage = q.passageId ? passages[q.passageId] : null;
@@ -276,6 +285,7 @@ const navigateToQuestion = (index) => {
 
 const getSelectedAnswer = () => {
     const q = questions[currentQuestionIndex];
+    if (q.type === 'CODE') return testState[currentQuestionIndex].answer || null;   // set by Submit Code
     if (q.type === 'NAT') {
         const natInput = document.getElementById('nat-answer');
         const value = natInput ? natInput.value.trim() : '';
@@ -334,7 +344,8 @@ const handleClearResponse = () => {
     testState[currentQuestionIndex].answer = null;
     testState[currentQuestionIndex].attempted = false; 
     const q = questions[currentQuestionIndex];
-    if (q.type === 'NAT' && document.getElementById('nat-answer')) document.getElementById('nat-answer').value = '';
+    if (q.type === 'CODE') { /* the submission is cleared; the code in the editor stays */ }
+    else if (q.type === 'NAT' && document.getElementById('nat-answer')) document.getElementById('nat-answer').value = '';
     else document.querySelectorAll(`#options-container input`).forEach(input => input.checked = false);
     
     if (testState[currentQuestionIndex].status.includes('marked_for_review')) testState[currentQuestionIndex].status = 'marked_for_review';
@@ -342,6 +353,15 @@ const handleClearResponse = () => {
     
     renderQuestion();
     renderPalette();
+};
+
+// Called by exam_coding.js after "Submit Code": the submission counts as the answer
+window.onCodingSubmitted = (index) => {
+    const st = testState[index];
+    st.attempted = true;
+    st.status = st.status.includes('marked') ? 'answered_marked_for_review' : 'answered';
+    if (index === currentQuestionIndex) renderPalette();
+    performAutosave();
 };
 
 const showSubmitModal = () => {
@@ -386,6 +406,16 @@ const handleTestSubmit = () => {
             attemptedCount++;
             const userAnswers = Array.isArray(state.answer) ? state.answer.map(String) : [String(state.answer)];
             let isCorrect = false;
+            if (q.type === 'CODE') {
+                // Marks in proportion to the test cases the last submission passed; no negative marks
+                const a = state.answer || {};
+                const earned = a.total ? q.marks * (a.passed || 0) / a.total : 0;
+                score += earned;
+                state.isCorrect = (a.total && a.passed === a.total) ? 'correct' : 'wrong';
+                state.codeMarks = earned;
+                if (state.answer) state.answer.timeSpentSec = timeSpentPerQuestion[index] || 0;
+                return { question_id: q.id, selected_answer: JSON.stringify(state.answer), is_correct: state.isCorrect === 'correct' ? 1 : 0 };
+            }
             if (q.type === 'NAT') {
                 const userNum = parseFloat(userAnswers[0]);
                 if (!isNaN(userNum) && userNum >= q.range[0] && userNum <= q.range[1]) isCorrect = true;
@@ -426,11 +456,16 @@ const handleTestSubmit = () => {
     questions.forEach((q, idx) => {
         const st = testState[idx];
         const qTime = timeSpentPerQuestion[idx] || 0;
-        const given = st.answer ? (Array.isArray(st.answer) ? st.answer.join(', ') : String(st.answer)) : '—';
+        let given = st.answer ? (Array.isArray(st.answer) ? st.answer.join(', ') : String(st.answer)) : '—';
         let correct = q.correctAnswer ? (Array.isArray(q.correctAnswer) ? q.correctAnswer.join(', ') : String(q.correctAnswer)) : '—';
         if (q.type === 'NAT') correct = `${q.range[0]} to ${q.range[1]}`;
+        if (q.type === 'CODE') {
+            given = st.answer ? `${st.answer.passed}/${st.answer.total} test cases passed${st.answer.compileError ? ' (compilation error)' : ''}, ${(st.codeMarks || 0).toFixed(2)} of ${q.marks} marks` : 'Not submitted';
+            correct = `All ${q.coding.tests.length} test cases`;
+        }
         
         let statusText = (st.isCorrect === 'correct') ? 'Correct' : (st.isCorrect === 'wrong') ? 'Wrong' : 'Unattempted';
+        if (q.type === 'CODE' && st.isCorrect === 'wrong' && st.codeMarks > 0) statusText = 'Partly correct';
         let statusColor = (st.isCorrect === 'correct') ? 'text-green-600' : (st.isCorrect === 'wrong') ? 'text-red-600' : 'text-gray-500';
 
         const block = document.createElement('div');
@@ -490,6 +525,9 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (e.key === 'F5' || (e.ctrlKey && (e.key === 'r' || e.key === 'R'))) triggerViolation("Page refresh."); 
                 else if (e.key === 'Escape') triggerViolation("Escape key pressed."); 
                 else if (e.altKey || e.metaKey) triggerViolation("Special key pressed.");
+                // Typing is allowed only in the coding editor and its custom-input box
+                else if (e.target && e.target.classList && e.target.classList.contains('code-input')
+                         && !(e.ctrlKey && !'acvxyz'.includes(String(e.key).toLowerCase()))) return;
             }
             e.preventDefault(); e.stopPropagation(); return false;
         }, true); 

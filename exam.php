@@ -16,7 +16,10 @@ if ($conn->connect_error) {
 }
 
 require_once __DIR__ . '/modules/sections.php';
+require_once __DIR__ . '/modules/coding.php';
 ensure_sections_schema($conn);
+ensure_coding_schema($conn);
+$coding_filter = coding_filter_sql($conn);   // hides coding questions unless the admin switched them on
 
 // Creating User session
 $user_id = $_SESSION['user_id'];
@@ -155,7 +158,7 @@ if ($selected_set) {
             FROM questions q
             LEFT JOIN sections sec ON sec.section_id = q.section_id
             LEFT JOIN passages p ON p.passage_id = q.passage_id
-            WHERE q.set_no = ? AND q.subject_id = ?
+            WHERE q.set_no = ? AND q.subject_id = ?$coding_filter
             ORDER BY COALESCE(sec.sort_order, 2147483647), q.section_id, (p.passage_id IS NOT NULL), p.passage_id, RAND()";
     $stmt = $conn->prepare($sql);
     $stmt->bind_param("ii", $selected_set_int, $selected_subject);
@@ -182,6 +185,18 @@ if ($selected_set) {
         ];
     }
     $stmt->close();
+
+    // Coding questions: statement, languages, starter code and test cases
+    $code_ids = array_column(array_filter($questions, fn($q) => $q['type'] === 'CODE'), 'id');
+    $problems = fetch_coding_problems($conn, $code_ids);
+    foreach ($questions as $i => $q) {
+        if ($q['type'] !== 'CODE') continue;
+        if (!isset($problems[$q['id']])) { unset($questions[$i]); continue; }
+        $questions[$i]['coding'] = coding_exam_payload($problems[$q['id']]);
+        $questions[$i]['options'] = [];
+        $questions[$i]['correctAnswer'] = [];
+    }
+    $questions = array_values($questions);
     $conn->close();
 
     $questions_json = json_encode($questions, JSON_INVALID_UTF8_IGNORE);
@@ -196,7 +211,7 @@ if ($selected_set) {
                  INNER JOIN set_time s ON q.set_no = s.set_no AND q.subject_id = s.subject_id
                  INNER JOIN subjects subj ON s.subject_id = subj.subject_id
                  WHERE s.start_time IS NOT NULL AND s.attempt_till IS NOT NULL
-                   AND NOW() BETWEEN s.start_time AND s.attempt_till
+                   AND NOW() BETWEEN s.start_time AND s.attempt_till$coding_filter
                  ORDER BY subj.subject_name, q.set_no ASC";
     $result_sets = $conn->query($sql_sets);
     if ($result_sets && $result_sets->num_rows > 0) {
@@ -224,7 +239,8 @@ if ($selected_set) {
     <script src="<?= CDN_JQUERY_UI ?>"></script>
     <link rel="stylesheet" href="modules/exam_style.css">
     <link rel="stylesheet" href="modules/calculator.css">
-    <link rel="stylesheet" href="modules/exam_popups.css">
+    <link rel="stylesheet" href="modules/exam_popups.css?v=4">
+    <link rel="stylesheet" href="modules/exam_coding.css?v=1">
 
     <style>
         .watermark-container::before {
@@ -266,30 +282,14 @@ if ($selected_set) {
             ════════════════════════════════════════════ -->
             <header class="border-b border-gray-300 shadow-sm z-10 flex-shrink-0">
 
-                <!-- Top strip: exam logo | banner image | institute logo -->
-                <div class="flex items-center" style="background-color:#F2A71B; border-top:4px solid #6E1E2C; border-bottom:4px solid #6E1E2C; height:130px; overflow:hidden;">
-
-                    <!-- Exam logo (left) -->
-                    <div class="flex-shrink-0 px-3 h-full flex items-center">
-                        <img src="<?= EXAM_LOGO_URL ?>"
-                             alt="<?= htmlspecialchars(EXAM_NAME) ?> Logo"
-                             class="h-24 w-auto">
+                <!-- Top strip (as on the real GATE exam page): exam logo | exam name + organising institute | institute logo -->
+                <div class="flex items-center justify-between bg-white px-4" style="height:64px;">
+                    <img src="<?= EXAM_LOGO_URL ?>" alt="<?= htmlspecialchars(EXAM_NAME) ?> Logo" style="height:48px; width:auto; max-width:120px; object-fit:contain;">
+                    <div class="text-center leading-tight px-4 whitespace-nowrap">
+                        <div style="font-size:19px; font-weight:700; color:#3b2f7d; letter-spacing:0.3px;"><?= htmlspecialchars(strtoupper(EXAM_FULL_NAME)) ?></div>
+                        <div style="font-size:12px; font-weight:700; color:#c2410c;">Organizing Institute : <?= htmlspecialchars(strtoupper(ORGANIZING_INSTITUTE)) ?></div>
                     </div>
-
-                    <!-- Centre banner image -->
-                    <div class="flex-1 h-full overflow-hidden">
-                        <img src="<?= EXAM_BANNER_URL ?>"
-                             alt="<?= htmlspecialchars(EXAM_NAME . ' — ' . INSTITUTE_SHORT_NAME) ?>"
-                             class="w-full h-full object-cover object-center">
-                    </div>
-
-                    <!-- Institute logo (right) -->
-                    <div class="flex-shrink-0 px-3 h-full flex items-center">
-                        <img src="<?= INSTITUTE_LOGO_URL ?>"
-                             alt="<?= htmlspecialchars(INSTITUTE_SHORT_NAME . ' Logo') ?>"
-                             class="h-24 w-auto">
-                    </div>
-
+                    <img src="<?= INSTITUTE_LOGO_URL ?>" alt="<?= htmlspecialchars(INSTITUTE_SHORT_NAME . ' Logo') ?>" style="height:48px; width:auto; max-width:120px; object-fit:contain;">
                 </div>
 
                 <!-- Sub-header: subject name + calculator -->
@@ -393,8 +393,8 @@ if ($selected_set) {
                                 <!-- Passage pane: shown on the left for passage (comprehension) questions -->
                                 <div id="passage-pane" style="display:none" class="w-1/2 border-r-2 border-gray-300 p-6 overflow-y-auto watermark-container">
                                     <div class="relative z-10">
-                                        <p class="font-bold text-black mb-3"><span class="text-red-600">NOTE:</span> After selecting your response to the sub question, you must click <span class="text-red-600">'SAVE &amp; NEXT'</span> to move to the next sub question.</p>
-                                        <p class="font-bold text-black mb-3">Read the passage given below and answer the questions that follow:</p>
+                                        <p class="passage-note font-bold text-black mb-3"><span class="text-red-600">NOTE:</span> After selecting your response to the sub question, you must click <span class="text-red-600">'SAVE &amp; NEXT'</span> to move to the next sub question.</p>
+                                        <p class="passage-note font-bold text-black mb-3">Read the passage given below and answer the questions that follow:</p>
                                         <div id="passage-content" class="text-[15px] text-gray-900 leading-relaxed"></div>
                                     </div>
                                 </div>
@@ -667,8 +667,13 @@ if ($selected_set) {
     <script src="modules/face_proctor.js?v=3"></script>
     <?php endif; ?>
     <script src="modules/calculator.js"></script>
-    <script src="modules/exam_app.js?v=6"></script>
-    <script src="modules/exam_popups.js?v=2"></script>
+    <?php if (strpos($questions_json, '"type":"CODE"') !== false): ?>
+    <script>window.CODE_COMPILERS_URL = <?= json_encode(defined('CODE_COMPILERS_URL') ? CODE_COMPILERS_URL : 'vendor/compilers') ?>;</script>
+    <script src="modules/coderun/runner.js?v=1"></script>
+    <script src="modules/exam_coding.js?v=2"></script>
+    <?php endif; ?>
+    <script src="modules/exam_app.js?v=8"></script>
+    <script src="modules/exam_popups.js?v=4"></script>
 
 </body>
 </html>

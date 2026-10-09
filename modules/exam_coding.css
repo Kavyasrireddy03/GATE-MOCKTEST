@@ -1,0 +1,47 @@
+/* exam_coding.css: coding questions on the exam page (TCS NQT style) */
+#passage-pane.cq-left { width: 45%; }
+#passage-pane.cq-left .passage-note { display: none; }
+
+.cq-title { font-size: 18px; font-weight: 700; color: #111; margin-bottom: 10px; }
+.cq-block { margin-bottom: 14px; }
+.cq-h { font-weight: 700; color: #1f2937; margin: 6px 0 4px; }
+.cq-sub { font-size: 12px; color: #6b7280; font-weight: 600; }
+.cq-text { white-space: pre-wrap; color: #111827; font-size: 15px; line-height: 1.55; }
+.cq-pre { white-space: pre-wrap; word-break: break-word; font-family: Consolas, 'Courier New', monospace; font-size: 13px;
+          background: #f3f4f6; border: 1px solid #e5e7eb; padding: 6px 8px; margin: 0 0 6px; min-height: 28px; }
+
+.cq-editor-wrap { display: flex; flex-direction: column; gap: 8px; }
+.cq-toolbar { display: flex; align-items: center; justify-content: space-between; font-size: 14px; font-weight: 600; }
+.cq-toolbar select { border: 1px solid #9ca3af; padding: 3px 6px; margin-left: 6px; background: #fff; }
+.cq-editor { display: flex; border: 1px solid #9ca3af; background: #1e1e1e; height: 340px; }
+.cq-gutter { width: 44px; flex-shrink: 0; overflow: hidden; background: #252526; color: #858585; text-align: right;
+             padding: 8px 6px 8px 0; font: 14px/20px Consolas, 'Courier New', monospace; user-select: none; }
+#cq-code { flex: 1; resize: none; border: 0; outline: none; background: #1e1e1e; color: #d4d4d4; padding: 8px 10px;
+           font: 14px/20px Consolas, 'Courier New', monospace; tab-size: 4; white-space: pre; overflow: auto; }
+.cq-custom { font-size: 14px; }
+.cq-custom textarea { width: 100%; margin-top: 4px; border: 1px solid #9ca3af; padding: 6px; font: 13px Consolas, 'Courier New', monospace; }
+.cq-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.cq-btn { background: #287baf; color: #fff; border: 1px solid #1f6491; padding: 6px 16px; font-size: 14px; font-weight: 600; }
+.cq-btn:hover { background: #1f6491; }
+.cq-btn-green { background: #2e7d32; border-color: #1b5e20; }
+.cq-btn-green:hover { background: #1b5e20; }
+.cq-btn:disabled, .cq-btn-light:disabled { opacity: .55; cursor: wait; }
+.cq-btn-light { background: #fff; border: 1px solid #9ca3af; padding: 3px 10px; font-size: 13px; }
+.cq-output { border: 1px solid #d1d5db; background: #fafafa; padding: 8px 10px; min-height: 80px; max-height: 320px; overflow: auto; font-size: 14px; }
+.cq-status { color: #374151; }
+.cq-err { color: #b91c1c; }
+.cq-warnlog { color: #92400e; }
+.cq-compile-err { color: #b91c1c; font-weight: 600; }
+.cq-case { padding: 4px 0; border-bottom: 1px dashed #e5e7eb; }
+.cq-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; }
+.cq-dot.ok { background: #16a34a; }
+.cq-dot.bad { background: #dc2626; }
+.cq-cmp { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-top: 4px; }
+.cq-badge { font-size: 13px; font-weight: 600; padding: 2px 8px; border-radius: 3px; }
+.cq-badge.ok { background: #dcfce7; color: #166534; }
+.cq-badge.part { background: #fef9c3; color: #854d0e; }
+.cq-warn { font-size: 12px; color: #b45309; }
+
+/* Question Paper popup */
+.xp-code-title { font-weight: 700; margin-bottom: 4px; }
+.xp-code-text { white-space: pre-wrap; font-size: 14px; }

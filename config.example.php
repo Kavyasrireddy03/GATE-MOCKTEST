@@ -53,6 +53,10 @@ define('CDN_CROPPER_JS', 'https://cdn.jsdelivr.net/npm/cropperjs@1.5.13/dist/cro
 define('CDN_FACE_API', 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.15/dist/face-api.js');
 define('FACE_API_MODEL_URL', 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.15/model');
 
+// Compilers for coding questions (C, C++, Python 3, JavaScript). They run in the candidate's browser,
+// so no online compiler API is used. Default: the copies shipped in vendor/compilers on this site.
+define('CODE_COMPILERS_URL', 'vendor/compilers');
+
 date_default_timezone_set(APP_TIMEZONE);
 
 // Pages that don't need the database (e.g. ErrorPage.php) define SKIP_DB first.

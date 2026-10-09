@@ -1,0 +1,7 @@
+# Compiler files for coding questions: serve WebAssembly with the right type and let browsers cache them
+AddType application/wasm .wasm
+AddType application/javascript .mjs
+<IfModule mod_expires.c>
+    ExpiresActive On
+    ExpiresDefault "access plus 30 days"
+</IfModule>

@@ -6,6 +6,7 @@ include 'db.php';
 require_once 'dompdf/autoload.inc.php'; 
 use Dompdf\Dompdf;
 use Dompdf\Options;
+require_once __DIR__ . '/modules/coding.php';
 
 /* ==========================
    ADMIN ACCESS PROTECTION
@@ -96,6 +97,13 @@ if (isset($_POST['export_responses'])) {
         $ans_query = "SELECT selected_answer, is_correct FROM attempt_answers WHERE attempt_id = '$attempt_id' AND question_id = '$q_id'";
         $ans_res = $conn->query($ans_query);
         $user_ans = $ans_res->fetch_assoc();
+
+        // Coding questions: problem, code, time spent and a tick / cross per test case
+        if ($q_type === 'CODE') {
+            $html .= coding_report_html($conn, $q_row, $q_num, $meta['subject_name'], $user_ans['selected_answer'] ?? null);
+            $q_num++;
+            continue;
+        }
 
         if (!$user_ans || empty($user_ans['selected_answer']) || $user_ans['selected_answer'] == 'null') {
             $statusClass = 'status-skipped';

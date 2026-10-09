@@ -11,7 +11,9 @@ $conn->set_charset('utf8mb4');
 
 require_once __DIR__ . '/modules/admin_helpers.php';
 require_once __DIR__ . '/modules/sections.php';
+require_once __DIR__ . '/modules/coding.php';
 ensure_sections_schema($conn);
+ensure_coding_schema($conn);
 
 $subject_id = (int)($_REQUEST['subject'] ?? 0);
 $set_no     = (int)($_REQUEST['set'] ?? 0);
@@ -32,6 +34,13 @@ function passage_section($conn, $passage_id) {
 
 // ======================= ACTIONS =======================
 $action = $_POST['pb_action'] ?? '';
+
+// ---- Coding questions on/off for candidates (whole site) ----
+if ($action === 'toggle_coding') {
+    $on = !empty($_POST['coding_on']);
+    set_coding_enabled($conn, $on);
+    back($on ? 'Coding questions are ON: candidates now see them in the exam.' : 'Coding questions are OFF: candidates do not see them.');
+}
 if ($action !== '' && ($subject_id <= 0 || $set_no <= 0)) back('Open a test (subject and set number) first.');
 
 // ---- Save one question (new or edit), standalone or inside a group ----
@@ -114,7 +123,69 @@ if ($action === 'remove_question') {
 if ($action === 'delete_question') {
     $id = (int)$_POST['id'];
     $conn->query("DELETE FROM questions WHERE id = $id AND subject_id = $subject_id AND set_no = $set_no");
+    if ($conn->affected_rows > 0) $conn->query("DELETE FROM coding_problems WHERE question_id = $id");
     back('Question deleted permanently.');
+}
+
+// ---- Save a coding question (new or edit) ----
+if ($action === 'save_coding') {
+    $id = (int)($_POST['id'] ?? 0);
+    $section_id = id_or_null($_POST['section_id'] ?? null);
+    $anchor = "section-" . ($section_id ?: 0);
+    $marks = (float)($_POST['marks'] ?? 10);
+    $title = trim($_POST['title'] ?? '');
+    $statement = trim($_POST['statement'] ?? '');
+    $input_format = trim($_POST['input_format'] ?? '');
+    $output_format = trim($_POST['output_format'] ?? '');
+    $constraints = trim($_POST['constraints_text'] ?? '');
+    $time_limit_ms = (int)round(max(0.5, min(10, (float)($_POST['time_limit'] ?? 2))) * 1000);
+    $languages = array_values(array_intersect(array_keys(CODING_LANGUAGES), (array)($_POST['languages'] ?? [])));
+    if ($title === '' || $statement === '') back('A coding question needs a title and a problem statement.', $anchor);
+    if (!$languages) back('Allow at least one language.', $anchor);
+
+    $starter = [];
+    foreach ($languages as $lang) {
+        $code = str_replace("\r\n", "\n", (string)($_POST['starter'][$lang] ?? ''));
+        if (trim($code) !== '' && $code !== CODING_STARTER[$lang]) $starter[$lang] = $code;
+    }
+
+    $tests = [];
+    $inputs = $_POST['test_input'] ?? [];
+    ksort($inputs);
+    foreach ($inputs as $k => $in) {
+        $in = str_replace("\r\n", "\n", (string)$in);
+        $out = str_replace("\r\n", "\n", (string)($_POST['test_output'][$k] ?? ''));
+        if (trim($in) === '' && trim($out) === '') continue;
+        $tests[] = ['input' => $in, 'output' => $out, 'sample' => !empty($_POST['test_sample'][$k])];
+    }
+    if (!$tests) back('Add at least one test case.', $anchor);
+
+    // Optional picture (a figure or table) shown under the statement
+    $q_text_url = !empty($_POST['remove_image']) ? '' : trim($_POST['existing_q_url'] ?? '');
+    if (!empty($_FILES['q_file']['name'])) {
+        $url = uploadToGoogleDrive($_FILES['q_file']);
+        if (!$url) back("Image upload failed. $DRIVE_ERROR", $anchor);
+        $q_text_url = $url;
+    }
+
+    $type = 'CODE'; $empty = '[]';
+    if ($id > 0) {
+        $stmt = $conn->prepare("UPDATE questions SET section_id=?, passage_id=NULL, q_type=?, q_text_url=?, options_json=?, correct_answer_json=?, marks=?, range_min=NULL, range_max=NULL WHERE id=? AND subject_id=? AND set_no=?");
+        $stmt->bind_param("issssdiii", $section_id, $type, $q_text_url, $empty, $empty, $marks, $id, $subject_id, $set_no);
+        if (!$stmt->execute() ) back('Database error: ' . $stmt->error, $anchor);
+    } else {
+        $stmt = $conn->prepare("INSERT INTO questions (subject_id, set_no, section_id, q_type, q_text_url, options_json, correct_answer_json, explanation, marks) VALUES (?, ?, ?, ?, ?, ?, ?, '', ?)");
+        $stmt->bind_param("iiissssd", $subject_id, $set_no, $section_id, $type, $q_text_url, $empty, $empty, $marks);
+        if (!$stmt->execute()) back('Database error: ' . $stmt->error, $anchor);
+        $id = $conn->insert_id;
+    }
+    $langs = implode(',', $languages);
+    $starter_json = json_encode((object)$starter);
+    $tests_json = json_encode($tests);
+    $stmt = $conn->prepare("REPLACE INTO coding_problems (question_id, title, statement, input_format, output_format, constraints_text, languages, starter_json, tests_json, time_limit_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    $stmt->bind_param("issssssssi", $id, $title, $statement, $input_format, $output_format, $constraints, $langs, $starter_json, $tests_json, $time_limit_ms);
+    if (!$stmt->execute()) back('Database error: ' . $stmt->error, $anchor);
+    back((int)($_POST['id'] ?? 0) > 0 ? 'Coding question saved.' : 'Coding question added.', $anchor);
 }
 
 // ---- Create or edit a question group (passage) ----
@@ -179,6 +250,7 @@ if ($action === 'add_from_bank') {
         $stmt->bind_param("iiiii", $set_no, $section_id, $passage_id, $qid, $subject_id);
         if ($stmt->execute()) $n += $stmt->affected_rows;
     }
+    $conn->query("UPDATE questions SET passage_id = NULL WHERE q_type = 'CODE' AND passage_id IS NOT NULL"); // coding questions are never in a group
     back("$n question(s) added to this test.", $passage_id ? "group-$passage_id" : "section-" . ($section_id ?: 0));
 }
 
@@ -230,13 +302,18 @@ if ($test_open) {
             $by_section[(int)$row['section_id']]['standalone'][] = (int)$row['id'];
         }
     }
+    foreach (fetch_coding_problems($conn, array_keys($questions)) as $qid => $p) {
+        $questions[$qid]['coding'] = $p;
+    }
     foreach ($groups as $pid => $g) {
         $sec = (int)($g['section_id'] ?? 0);
         if (!$sec && $g['questions']) $sec = (int)$questions[$g['questions'][0]]['section_id'];
         $by_section[$sec]['groups'][] = $pid;
     }
 
-    $r = $conn->query("SELECT id, q_type, q_text_url, marks FROM questions WHERE subject_id = $subject_id AND (set_no IS NULL OR set_no = 0) ORDER BY id DESC LIMIT 300");
+    $r = $conn->query("SELECT q.id, q.q_type, q.q_text_url, q.marks, cp.title AS coding_title FROM questions q
+                       LEFT JOIN coding_problems cp ON cp.question_id = q.id
+                       WHERE q.subject_id = $subject_id AND (q.set_no IS NULL OR q.set_no = 0) ORDER BY q.id DESC LIMIT 300");
     while ($row = $r->fetch_assoc()) $bank[] = $row;
 }
 
@@ -246,6 +323,11 @@ foreach ($sections as $s) $section_list[] = ['key' => (int)$s['section_id'], 'na
 if (!empty($by_section[0]) || !$sections) $section_list[] = ['key' => 0, 'name' => 'No section (shown as "' . ($subject_name ?: 'subject') . '")'];
 
 function answer_text($q) {
+    if ($q['q_type'] === 'CODE') {
+        $tests = $q['coding']['tests'] ?? [];
+        $samples = count(array_filter($tests, fn($t) => !empty($t['sample'])));
+        return count($tests) . ' test case' . (count($tests) === 1 ? '' : 's') . " ($samples sample, " . (count($tests) - $samples) . ' hidden)';
+    }
     if ($q['q_type'] === 'NAT') return $q['range_min'] . ' to ' . $q['range_max'];
     $letters = [];
     foreach ($q['options_json'] as $i => $o) if (in_array($o['text'], $q['correct_answer_json'], true)) $letters[] = chr(65 + $i);
@@ -257,6 +339,8 @@ $total_marks = array_sum(array_map(fn($q) => (float)$q['marks'], $questions));
 $message = $_SESSION['pb_message'] ?? ''; unset($_SESSION['pb_message']);
 $open_group = $_SESSION['pb_open_question_for_group'] ?? 0; unset($_SESSION['pb_open_question_for_group']);
 $qno = 0;   // running question number, in exam order
+$coding_on = coding_enabled($conn);
+$coding_langs = CODING_LANGUAGES;
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -290,6 +374,20 @@ $qno = 0;   // running question number, in exam order
     <?php if ($message): ?>
         <div class="bg-green-600 text-white p-3 rounded mb-4"><?= htmlspecialchars($message) ?></div>
     <?php endif; ?>
+
+    <!-- Coding questions switch -->
+    <form method="POST" class="p-4 rounded-xl shadow mb-6 flex flex-wrap items-center gap-4 <?= $coding_on ? 'bg-green-50 border border-green-300' : 'bg-white' ?>">
+        <input type="hidden" name="subject" value="<?= $subject_id ?>"><input type="hidden" name="set" value="<?= $set_no ?>">
+        <input type="hidden" name="pb_action" value="toggle_coding">
+        <input type="hidden" name="coding_on" value="<?= $coding_on ? '' : '1' ?>">
+        <div class="flex-grow">
+            <div class="font-bold">Coding questions: <span id="coding-state" class="<?= $coding_on ? 'text-green-700' : 'text-gray-500' ?>"><?= $coding_on ? 'ON' : 'OFF' ?></span></div>
+            <div class="text-sm text-gray-600"><?= $coding_on
+                ? 'Candidates see coding questions (code editor with Compile and Submit Code). Code runs inside the candidate\'s browser: C, C++, Python 3, JavaScript; no online compiler API.'
+                : 'Coding questions are hidden from candidates and you cannot add new ones. Switch on to add coding questions to a section.' ?></div>
+        </div>
+        <button id="coding-toggle" class="px-5 py-2 rounded font-bold text-white <?= $coding_on ? 'bg-gray-600' : 'bg-green-600' ?>"><?= $coding_on ? 'Turn off' : 'Turn on' ?></button>
+    </form>
 
     <!-- Step 1: choose the test -->
     <form method="GET" class="bg-white p-4 rounded-xl shadow mb-6 flex flex-wrap items-end gap-4">
@@ -342,6 +440,9 @@ $qno = 0;   // running question number, in exam order
             <div class="flex gap-2 text-sm">
                 <button onclick="openQuestion(<?= $key ?>, 0, 0)" class="bg-white text-[#287baf] font-bold px-3 py-1 rounded">+ Question</button>
                 <button onclick="openGroup(<?= $key ?>, 0)" class="bg-white text-purple-700 font-bold px-3 py-1 rounded">+ Question group (passage)</button>
+                <?php if ($coding_on): ?>
+                <button onclick="openCoding(<?= $key ?>, 0)" class="bg-white text-green-700 font-bold px-3 py-1 rounded">+ Coding question</button>
+                <?php endif; ?>
                 <button onclick="openBank(<?= $key ?>, 0)" class="bg-[#1f6491] border border-white px-3 py-1 rounded">+ From question bank</button>
             </div>
         </div>
@@ -451,6 +552,94 @@ $qno = 0;   // running question number, in exam order
         </form>
     </div>
 
+    <!-- ============ CODING QUESTION MODAL ============ -->
+    <div id="c-modal" class="modal">
+        <form method="POST" enctype="multipart/form-data" onsubmit="return submitCoding(this)" class="bg-white rounded-xl shadow-2xl w-full max-w-5xl">
+            <input type="hidden" name="subject" value="<?= $subject_id ?>"><input type="hidden" name="set" value="<?= $set_no ?>">
+            <input type="hidden" name="pb_action" value="save_coding">
+            <input type="hidden" name="id" id="cm-id">
+            <input type="hidden" name="section_id" id="cm-section">
+            <input type="hidden" name="existing_q_url" id="cm-existing-q">
+            <div class="px-6 py-4 border-b flex justify-between items-center">
+                <h3 id="cm-title" class="text-xl font-bold">Add coding question</h3>
+                <button type="button" onclick="closeModal('c-modal')" class="text-2xl leading-none">&times;</button>
+            </div>
+            <div class="p-6 space-y-4">
+                <div id="cm-where" class="text-sm bg-gray-50 border rounded px-3 py-2"></div>
+                <div class="grid grid-cols-6 gap-4">
+                    <div class="col-span-4">
+                        <label class="block text-sm font-bold">Title</label>
+                        <input name="title" id="cm-name" class="w-full border p-2 rounded" placeholder="e.g. Sum of even numbers" required>
+                    </div>
+                    <div>
+                        <label class="block text-sm font-bold">Marks</label>
+                        <input type="number" step="0.5" min="0" name="marks" id="cm-marks" value="10" class="w-full border p-2 rounded">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-bold">Time limit (s)</label>
+                        <input type="number" step="0.5" min="0.5" max="10" name="time_limit" id="cm-tl" value="2" class="w-full border p-2 rounded">
+                    </div>
+                </div>
+                <div>
+                    <label class="block text-sm font-bold">Problem statement</label>
+                    <textarea name="statement" id="cm-statement" rows="6" class="w-full border p-2 rounded" required placeholder="Describe the problem"></textarea>
+                </div>
+                <div class="grid grid-cols-3 gap-4">
+                    <div><label class="block text-sm font-bold">Input format</label><textarea name="input_format" id="cm-in" rows="3" class="w-full border p-2 rounded text-sm"></textarea></div>
+                    <div><label class="block text-sm font-bold">Output format</label><textarea name="output_format" id="cm-out" rows="3" class="w-full border p-2 rounded text-sm"></textarea></div>
+                    <div><label class="block text-sm font-bold">Constraints</label><textarea name="constraints_text" id="cm-cons" rows="3" class="w-full border p-2 rounded text-sm"></textarea></div>
+                </div>
+                <div class="p-3 bg-blue-50 border border-blue-200 rounded flex items-center gap-3">
+                    <label class="text-sm font-bold text-blue-800">Image under the statement (optional)</label>
+                    <img id="cm-thumb" class="thumb hidden">
+                    <label id="cm-remove-wrap" class="text-sm hidden"><input type="checkbox" name="remove_image" value="1"> Remove image</label>
+                    <input type="file" name="q_file" accept="image/*">
+                </div>
+                <div>
+                    <label class="block text-sm font-bold mb-1">Languages the candidate can use</label>
+                    <div class="flex gap-4">
+                        <?php foreach ($coding_langs as $lk => $ll): ?>
+                        <label class="flex items-center gap-1"><input type="checkbox" name="languages[]" value="<?= $lk ?>" class="cm-lang w-4 h-4" onchange="renderStarterTabs()"> <?= $ll ?></label>
+                        <?php endforeach; ?>
+                    </div>
+                </div>
+                <details class="border rounded">
+                    <summary class="px-3 py-2 cursor-pointer text-sm font-bold">Starter code (optional; a default template is used when left as is)</summary>
+                    <div class="p-3">
+                        <div id="cm-starter-tabs" class="flex gap-1 mb-2"></div>
+                        <div id="cm-starter-boxes"></div>
+                    </div>
+                </details>
+                <div>
+                    <div class="flex items-center justify-between">
+                        <label class="block text-sm font-bold">Test cases</label>
+                        <span class="text-xs text-gray-500">Sample cases are shown to the candidate with their output; hidden cases are only used for marks.
+                            Marks = marks &times; (cases passed &divide; all cases). Trailing spaces and blank lines are ignored.</span>
+                    </div>
+                    <div id="cm-tests" class="space-y-2 mt-1"></div>
+                    <button type="button" onclick="addTest()" class="mt-2 text-sm text-blue-700 font-bold">+ Add test case</button>
+                </div>
+                <details class="border rounded bg-gray-50" id="cm-solution">
+                    <summary class="px-3 py-2 cursor-pointer text-sm font-bold">Fill expected outputs from your own solution (optional, not saved)</summary>
+                    <div class="p-3 space-y-2">
+                        <div class="flex gap-2 items-center text-sm">
+                            <select id="cm-sol-lang" class="border p-1 rounded">
+                                <?php foreach ($coding_langs as $lk => $ll): ?><option value="<?= $lk ?>"><?= $ll ?></option><?php endforeach; ?>
+                            </select>
+                            <button type="button" onclick="runSolution()" class="bg-gray-800 text-white px-3 py-1 rounded">Run on all test inputs and fill outputs</button>
+                            <span id="cm-sol-status" class="text-gray-600"></span>
+                        </div>
+                        <textarea id="cm-sol-code" rows="8" class="w-full border p-2 rounded font-mono text-sm" spellcheck="false" placeholder="Paste a correct solution"></textarea>
+                    </div>
+                </details>
+            </div>
+            <div class="px-6 py-4 border-t flex justify-end gap-3">
+                <button type="button" onclick="closeModal('c-modal')" class="px-5 py-2 border rounded">Cancel</button>
+                <button class="px-6 py-2 bg-green-700 text-white rounded font-bold">Save coding question</button>
+            </div>
+        </form>
+    </div>
+
     <!-- ============ GROUP MODAL ============ -->
     <div id="g-modal" class="modal">
         <form method="POST" enctype="multipart/form-data" onsubmit="return submitGroup(this)" class="bg-white rounded-xl shadow-2xl w-full max-w-3xl">
@@ -522,7 +711,11 @@ $qno = 0;   // running question number, in exam order
                     <?php foreach ($bank as $b): ?>
                     <label class="flex items-center gap-3 border rounded p-2 cursor-pointer hover:bg-blue-50">
                         <input type="checkbox" name="question_ids[]" value="<?= $b['id'] ?>" class="w-5 h-5">
-                        <img src="<?= htmlspecialchars(img_src($b['q_text_url'])) ?>" class="thumb" loading="lazy">
+                        <?php if ($b['q_type'] === 'CODE'): ?>
+                            <span style="background:#111827;color:#86efac;max-width:220px" class="px-3 py-2 text-sm font-mono">&lt;/&gt; <?= htmlspecialchars($b['coding_title'] ?? 'Coding') ?></span>
+                        <?php else: ?>
+                            <img src="<?= htmlspecialchars(img_src($b['q_text_url'])) ?>" class="thumb" loading="lazy">
+                        <?php endif; ?>
                         <span class="text-sm">#<?= $b['id'] ?>, <?= $b['q_type'] ?>, <?= (float)$b['marks'] ?> mark(s)</span>
                     </label>
                     <?php endforeach; ?>
@@ -539,6 +732,8 @@ $qno = 0;   // running question number, in exam order
     <?php endif; ?>
 </div>
 
+<script>window.CODE_COMPILERS_URL = <?= json_encode(defined('CODE_COMPILERS_URL') ? CODE_COMPILERS_URL : 'vendor/compilers') ?>;</script>
+<script src="modules/coderun/runner.js?v=1"></script>
 <script>
 const QUESTIONS = <?= json_encode((object)$questions, JSON_HEX_TAG | JSON_HEX_AMP | JSON_INVALID_UTF8_IGNORE) ?>;
 const GROUPS = <?= json_encode((object)array_map(fn($g) => array_diff_key($g, ['questions' => 1]), $groups), JSON_HEX_TAG | JSON_HEX_AMP | JSON_INVALID_UTF8_IGNORE) ?>;
@@ -626,6 +821,103 @@ function submitQuestion(f) {
         if (document.querySelectorAll('#qm-options .opt-row').length < 2) { alert('Add at least two options.'); return false; }
         if (!f.querySelector('input[name="correct_idx[]"]:checked')) { alert('Tick the correct option.'); return false; }
     }
+    document.getElementById('loader').style.display = 'flex';
+    return true;
+}
+
+// ---------- Coding question modal ----------
+const CODING_LANGS = <?= json_encode($coding_langs) ?>;
+const CODING_STARTER = <?= json_encode(CODING_STARTER) ?>;
+let testKey = 0;
+let codingEditing = null;
+let starterCode = {};
+
+function openCoding(sectionKey, id) {
+    const q = id ? QUESTIONS[id] : null;
+    codingEditing = q && q.coding ? q.coding : null;
+    const p = codingEditing || {};
+    const f = document.getElementById('c-modal').querySelector('form');
+    f.reset();
+    document.getElementById('cm-title').textContent = id ? `Edit coding question #${id}` : 'Add coding question';
+    document.getElementById('cm-id').value = id || 0;
+    document.getElementById('cm-section').value = sectionKey || '';
+    document.getElementById('cm-where').innerHTML = whereText(sectionKey, 0);
+    document.getElementById('cm-name').value = p.title || '';
+    document.getElementById('cm-marks').value = q ? parseFloat(q.marks) : 10;
+    document.getElementById('cm-tl').value = p.time_limit_ms ? p.time_limit_ms / 1000 : 2;
+    document.getElementById('cm-statement').value = p.statement || '';
+    document.getElementById('cm-in').value = p.input_format || '';
+    document.getElementById('cm-out').value = p.output_format || '';
+    document.getElementById('cm-cons').value = p.constraints_text || '';
+    document.getElementById('cm-existing-q').value = q ? (q.q_text_url || '') : '';
+    const hasImg = !!(q && q.q_text_url);
+    document.getElementById('cm-thumb').classList.toggle('hidden', !hasImg);
+    document.getElementById('cm-remove-wrap').classList.toggle('hidden', !hasImg);
+    if (hasImg) document.getElementById('cm-thumb').src = imgSrc(q.q_text_url);
+    const langs = p.languages || Object.keys(CODING_LANGS);
+    document.querySelectorAll('.cm-lang').forEach(cb => cb.checked = langs.includes(cb.value));
+    starterCode = {};
+    Object.keys(CODING_LANGS).forEach(l => starterCode[l] = (p.starter && p.starter[l]) || CODING_STARTER[l]);
+    renderStarterTabs();
+    document.getElementById('cm-tests').innerHTML = '';
+    const tests = (p.tests && p.tests.length) ? p.tests : [{ input: '', output: '', sample: true }, { input: '', output: '', sample: false }];
+    tests.forEach(t => addTest(t));
+    document.getElementById('cm-sol-status').textContent = '';
+    openModal('c-modal');
+}
+
+let starterLang = null;
+function renderStarterTabs() {
+    const langs = [...document.querySelectorAll('.cm-lang:checked')].map(cb => cb.value);
+    document.querySelectorAll('#cm-starter-boxes textarea').forEach(t => starterCode[t.dataset.lang] = t.value);
+    if (!langs.includes(starterLang)) starterLang = langs[0] || null;
+    document.getElementById('cm-starter-tabs').innerHTML = langs.map(l =>
+        `<button type="button" onclick="starterLang='${l}'; renderStarterTabs()" class="px-3 py-1 text-sm rounded-t border ${l === starterLang ? 'bg-gray-800 text-white' : 'bg-white'}">${esc(CODING_LANGS[l])}</button>`).join('');
+    document.getElementById('cm-starter-boxes').innerHTML = langs.map(l =>
+        `<textarea name="starter[${l}]" data-lang="${l}" rows="8" spellcheck="false" class="w-full border p-2 rounded font-mono text-sm ${l === starterLang ? '' : 'hidden'}">${esc(starterCode[l])}</textarea>`).join('');
+}
+
+function addTest(t) {
+    t = t || { input: '', output: '', sample: false };
+    const k = testKey++;
+    const n = document.querySelectorAll('#cm-tests .test-row').length + 1;
+    document.getElementById('cm-tests').insertAdjacentHTML('beforeend', `<div class="test-row grid grid-cols-12 gap-2 p-2 border rounded bg-gray-50 items-start">
+        <div class="col-span-1 text-sm font-bold pt-2 test-no">#${n}</div>
+        <div class="col-span-5"><div class="text-xs text-gray-500">Input</div><textarea name="test_input[${k}]" rows="3" spellcheck="false" class="t-in w-full border p-1 rounded font-mono text-sm">${esc(t.input)}</textarea></div>
+        <div class="col-span-4"><div class="text-xs text-gray-500">Expected output</div><textarea name="test_output[${k}]" rows="3" spellcheck="false" class="t-out w-full border p-1 rounded font-mono text-sm">${esc(t.output)}</textarea></div>
+        <div class="col-span-2 text-sm pt-5 space-y-1">
+            <label class="flex items-center gap-1"><input type="checkbox" name="test_sample[${k}]" value="1" ${t.sample ? 'checked' : ''}> Sample</label>
+            <button type="button" onclick="this.closest('.test-row').remove(); renumberTests()" class="text-red-600 text-xs font-bold">Remove</button>
+        </div>
+    </div>`);
+}
+function renumberTests() { document.querySelectorAll('#cm-tests .test-no').forEach((el, i) => el.textContent = '#' + (i + 1)); }
+
+async function runSolution() {
+    const status = document.getElementById('cm-sol-status');
+    const code = document.getElementById('cm-sol-code').value;
+    const lang = document.getElementById('cm-sol-lang').value;
+    const rows = [...document.querySelectorAll('#cm-tests .test-row')];
+    if (!code.trim()) { status.textContent = 'Paste a solution first.'; return; }
+    if (!rows.length) { status.textContent = 'Add test inputs first.'; return; }
+    const tl = parseFloat(document.getElementById('cm-tl').value) || 2;
+    try {
+        const r = await CodeRunner.run(lang, code, rows.map(r => r.querySelector('.t-in').value), { timeLimitMs: tl * 1000, onStatus: s => status.textContent = s });
+        if (!r.compiled) { status.textContent = 'Compilation error:\n' + r.compileLog; alert('Compilation error:\n\n' + r.compileLog); return; }
+        let bad = 0;
+        r.results.forEach((res, i) => {
+            if (res.error) { bad++; return; }
+            rows[i].querySelector('.t-out').value = res.stdout.replace(/\s+$/, '');
+        });
+        status.textContent = bad ? `Filled ${r.results.length - bad} outputs; ${bad} test case(s) failed (time limit or runtime error).` : `Filled all ${r.results.length} expected outputs.`;
+    } catch (e) { status.textContent = 'Could not run: ' + e.message; }
+}
+
+function submitCoding(f) {
+    if (!f.querySelector('.cm-lang:checked')) { alert('Allow at least one language.'); return false; }
+    const rows = [...document.querySelectorAll('#cm-tests .test-row')].filter(r => r.querySelector('.t-in').value.trim() || r.querySelector('.t-out').value.trim());
+    if (!rows.length) { alert('Add at least one test case.'); return false; }
+    if (rows.some(r => !r.querySelector('.t-out').value.trim()) && !confirm('Some test cases have an empty expected output. Save anyway?')) return false;
     document.getElementById('loader').style.display = 'flex';
     return true;
 }

@@ -1,9 +1,10 @@
 <?php
 error_reporting(E_ALL);
-ini_set('display_errors', 1);
+ini_set('display_errors', 0);   // this page answers in JSON; a printed warning would break the exam's submit
 
 session_start();
 include 'db.php';
+require_once __DIR__ . '/modules/assessment.php';
 
 // Import PHPMailer classes
 use PHPMailer\PHPMailer\PHPMailer;
@@ -31,6 +32,7 @@ if (!$data || ($data['action'] ?? '') !== 'submit') {
 }
 
 $user_id = (int)$_SESSION['user_id'];
+ensure_assessment_schema($conn);
 $today = date('Y-m-d'); 
 
 /* ==============================
@@ -85,12 +87,21 @@ $stmt->close();
     5️⃣ INSERT INTO attempt_answers
 ============================== */
 if (isset($data['details']) && is_array($data['details'])) {
-    $stmt2 = $conn->prepare("INSERT INTO attempt_answers (attempt_id, question_id, selected_answer, is_correct) VALUES (?, ?, ?, ?)");
+    // Time spent, final status, response changes and question order are used by report.php
+    $stmt2 = $conn->prepare("INSERT INTO attempt_answers (attempt_id, question_id, selected_answer, is_correct, time_spent_sec, q_status, change_json, q_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
     foreach ($data['details'] as $row) {
-        $q_id = (int)($row['question_id'] ?? 0);
-        $ans  = $row['selected_answer'] ?? '';
-        $is_c = (int)($row['is_correct'] ?? 0);
-        $stmt2->bind_param("iisi", $attempt_id, $q_id, $ans, $is_c);
+        $q_id  = (int)($row['question_id'] ?? 0);
+        $ans   = $row['selected_answer'] ?? '';
+        $is_c  = (int)($row['is_correct'] ?? 0);
+        $spent = max(0, (int)($row['time_spent'] ?? 0));
+        $qst   = substr(preg_replace('/[^a-z_]/', '', (string)($row['q_status'] ?? '')), 0, 30);
+        $chg   = [];
+        foreach ((array)($row['changes'] ?? []) as $k => $v) {
+            if (in_array($k, ['CI', 'IC', 'II', 'CU', 'IU', 'UC', 'UI'], true)) $chg[$k] = (int)$v;
+        }
+        $chg_json = json_encode((object)$chg);
+        $order = (int)($row['q_order'] ?? 0);
+        $stmt2->bind_param("iisiissi", $attempt_id, $q_id, $ans, $is_c, $spent, $qst, $chg_json, $order);
         $stmt2->execute();
     }
     $stmt2->close();
@@ -112,6 +123,20 @@ $study_stmt = $conn->prepare("
 $study_stmt->bind_param("isss", $user_id, $today, $current_subject, $current_subject);
 $study_stmt->execute();
 $study_stmt->close();
+
+/* ==============================
+    5.9️⃣ ANSWER THE EXAM NOW
+    The responses are saved, so the exam can show "submitted successfully" at once;
+    the result email below is sent after the reply.
+============================== */
+ignore_user_abort(true);
+$reply = json_encode(['success' => true, 'attempt_id' => $attempt_id]);
+while (ob_get_level() > 0) ob_end_clean();
+header('Connection: close');
+header('Content-Length: ' . strlen($reply));
+echo $reply;
+flush();
+if (function_exists('fastcgi_finish_request')) fastcgi_finish_request();
 
 /* ==============================
     6️⃣ SEND SUCCESS EMAIL TO USER
@@ -159,6 +184,5 @@ if ($user_info && !empty($user_info['email'])) {
     } catch (Exception $e) { $email_status = "Error"; }
 }
 
-echo json_encode(['success' => true, 'attempt_id' => $attempt_id, 'email' => $email_status]);
 exit;
 ?>

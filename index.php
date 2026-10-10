@@ -132,7 +132,7 @@ tr:nth-child(even){ background:#f9f9f9; }
         <td><?= $s['attempt_till'] ? (new DateTime($s['attempt_till']))->modify('+5 hours 30 minutes')->format('d M, h:i A') : 'N/A' ?></td>
         <td>
             <a class="btn"
-               href="instructions.php?set_no=<?= urlencode($s['set_no'] . '|' . $s['subject_id']) ?>">
+               href="assessment.php?set_no=<?= urlencode($s['set_no'] . '|' . $s['subject_id']) ?>">
                 Start Test
             </a>
         </td>
